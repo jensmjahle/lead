@@ -80,3 +80,7 @@ core.*
 /*.sh
 /*.sif
 !/setup.py
+
+# Local artifacts
+checkpoints/
+outputs/

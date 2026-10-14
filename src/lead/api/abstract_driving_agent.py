@@ -209,7 +209,7 @@ class AbstractDrivingAgent(BaseAgent, autonomous_agent.AutonomousAgent, abc.ABC)
 
         # The scene data carries the per-tick sweeps as the logs store them; the
         # policy's featurization owns the merging and ground removal.
-        if self.lidar_sweep_queue.maxlen:
+        if self.lidar_sweep_queue.maxlen and "lidar_sweep" in sensor_data:
             self.lidar_sweep_queue.append(self._lidar_sweep(sensor_data))
         if (
             self.radar_sweep_queue.maxlen
@@ -267,7 +267,11 @@ class AbstractDrivingAgent(BaseAgent, autonomous_agent.AutonomousAgent, abc.ABC)
         target_points = self._target_points()
         return SceneData(
             cameras=self._cameras(sensor_data),
-            lidar_sweeps=dict(enumerate(reversed(self.lidar_sweep_queue))),
+            lidar_sweeps=(
+                dict(enumerate(reversed(self.lidar_sweep_queue)))
+                if self.lidar_sweep_queue
+                else None
+            ),
             radar_sweeps=(
                 dict(enumerate(reversed(self.radar_sweep_queue)))
                 if self.lead_config.expert.sensor_rig.use_radars
@@ -542,7 +546,7 @@ class AbstractDrivingAgent(BaseAgent, autonomous_agent.AutonomousAgent, abc.ABC)
         memory and render time."""
         return av_sensor_setup(
             config=self.lead_config.expert,
-            lidar=True,
+            lidar=os.environ.get("LEAD_EVAL_LIDAR", "true").lower() == "true",
             radar=self.lead_config.expert.sensor_rig.use_radars,
             sensor_agent=True,
             perturbate=False,

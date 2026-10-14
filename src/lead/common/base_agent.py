@@ -140,32 +140,33 @@ class BaseAgent:
             },
         )
 
-        # --- LiDAR (the rig always has two) ---
-        sensor_data["lidar"] = np.concatenate(
-            (
-                point_clouds.lidar_to_ego_coordinate(
-                    self.config_expert.sensor_rig.lidar_rot_1,
-                    self.config_expert.sensor_rig.lidar_pos_1,
-                    sensor_data["lidar1"],
+        # --- LiDAR (the rig always has two; absent when LEAD_EVAL_LIDAR=false) ---
+        if "lidar1" in sensor_data:
+            sensor_data["lidar"] = np.concatenate(
+                (
+                    point_clouds.lidar_to_ego_coordinate(
+                        self.config_expert.sensor_rig.lidar_rot_1,
+                        self.config_expert.sensor_rig.lidar_pos_1,
+                        sensor_data["lidar1"],
+                    ),
+                    point_clouds.lidar_to_ego_coordinate(
+                        self.config_expert.sensor_rig.lidar_rot_2,
+                        self.config_expert.sensor_rig.lidar_pos_2,
+                        sensor_data["lidar2"],
+                    ),
                 ),
-                point_clouds.lidar_to_ego_coordinate(
-                    self.config_expert.sensor_rig.lidar_rot_2,
-                    self.config_expert.sensor_rig.lidar_pos_2,
-                    sensor_data["lidar2"],
-                ),
-            ),
-            axis=0,
-        )
-        lidar_x, lidar_y = sensor_data["lidar"][:, 0], sensor_data["lidar"][:, 1]
-        # Remove lidar points inside ego bounding boxes. We already need LiDAR for expert.
-        sensor_data["lidar"] = sensor_data["lidar"][
-            (np.abs(lidar_x) > self.config_expert.simulation.ego_extent_x)
-            & (np.abs(lidar_y) > self.config_expert.simulation.ego_extent_y)
-        ]
-        # The raw sweep is what gets stored and what the expert's box labels
-        # count hits on; model-specific processing (ground removal, radar
-        # merging) is the driving agent's and the data loader's business.
-        sensor_data["lidar_sweep"] = sensor_data["lidar"]
+                axis=0,
+            )
+            lidar_x, lidar_y = sensor_data["lidar"][:, 0], sensor_data["lidar"][:, 1]
+            # Remove lidar points inside ego bounding boxes. We already need LiDAR for expert.
+            sensor_data["lidar"] = sensor_data["lidar"][
+                (np.abs(lidar_x) > self.config_expert.simulation.ego_extent_x)
+                & (np.abs(lidar_y) > self.config_expert.simulation.ego_extent_y)
+            ]
+            # The raw sweep is what gets stored and what the expert's box labels
+            # count hits on; model-specific processing (ground removal, radar
+            # merging) is the driving agent's and the data loader's business.
+            sensor_data["lidar_sweep"] = sensor_data["lidar"]
 
         # --- Radar ---
         if self.config_expert.sensor_rig.use_radars:
