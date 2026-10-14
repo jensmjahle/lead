@@ -165,6 +165,16 @@ def run_route(args, slot: Slot, route: Path, out_dir: Path) -> dict | None:
     env["PYTHONUNBUFFERED"] = "1"
     if args.lead_config:
         env["LEAD_CONFIG"] = args.lead_config
+    env["LEAD_SNOW"] = args.snow
+    env["LEAD_SNOW_FALL"] = "" if args.snow_fall is None else str(args.snow_fall)
+    env["LEAD_SNOW_COVER"] = "" if args.snow_cover is None else str(args.snow_cover)
+    env["LEAD_SNOW_SEED"] = str(args.snow_seed)
+    env["LEAD_TIRE_FRICTION"] = "" if args.tire_friction is None else str(args.tire_friction)
+    if args.snow_dump_every:
+        env["LEAD_SNOW_DUMP_DIR"] = "auto"
+        env["LEAD_SNOW_DUMP_EVERY"] = str(args.snow_dump_every)
+    else:
+        env.pop("LEAD_SNOW_DUMP_DIR", None)
     cmd = [
         sys.executable, "-m", "lead",
         "--checkpoint", str(args.checkpoint),
@@ -255,6 +265,15 @@ def main() -> None:
     parser.add_argument("--quality", default="Epic")
     parser.add_argument("--lidar", action="store_true", help="Keep the LiDAR sensors (off by default)")
     parser.add_argument("--lead-config", default="", help="Value for the LEAD_CONFIG override variable")
+    parser.add_argument("--snow", default="off",
+                        help="Snow preset: off, light, medium, heavy, fall_only, cover_only")
+    parser.add_argument("--snow-fall", type=float, default=None, help="Override falling-snow level")
+    parser.add_argument("--snow-cover", type=float, default=None, help="Override ground-cover level")
+    parser.add_argument("--tire-friction", type=float, default=None,
+                        help="Ego per-wheel tire_friction (CARLA default 3.5; 0.3 ~ packed snow)")
+    parser.add_argument("--snow-seed", type=int, default=0)
+    parser.add_argument("--snow-dump-every", type=int, default=0,
+                        help="Save raw/overlaid frames every N steps into each route dir (0 = off)")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--restart-every", type=int, default=10, help="Restart CARLA after N routes (0 = never)")
     parser.add_argument("--boot-timeout", type=float, default=240.0)

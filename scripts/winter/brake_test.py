@@ -29,32 +29,40 @@ def yaw_diff_deg(a: float, b: float) -> float:
     return (a - b + 180.0) % 360.0 - 180.0
 
 
-def find_straight_spawn(world_map: carla.Map, length_m: float, max_yaw_dev_deg: float) -> carla.Transform:
-    """Return a spawn point followed by at least length_m of straight, junction-free lane."""
-    best = None
-    for sp in world_map.get_spawn_points():
-        wp = world_map.get_waypoint(sp.location, project_to_road=True, lane_type=carla.LaneType.Driving)
-        if wp is None or wp.is_junction:
-            continue
-        yaw0 = wp.transform.rotation.yaw
-        travelled, ok, cur = 0.0, True, wp
-        while travelled < length_m:
-            nxt = cur.next(5.0)
-            if not nxt:
-                ok = False
-                break
-            cur = nxt[0]
-            travelled += 5.0
-            if cur.is_junction or abs(yaw_diff_deg(cur.transform.rotation.yaw, yaw0)) > max_yaw_dev_deg:
-                ok = False
-                break
-        if ok:
-            best = wp.transform
+def straight_length(wp: carla.Waypoint, max_len: float, max_yaw_dev_deg: float, step: float = 5.0) -> float:
+    """Length of straight lane ahead of wp, stopping at curves or junctions."""
+    yaw0 = wp.transform.rotation.yaw
+    travelled, cur = 0.0, wp
+    while travelled < max_len:
+        nxt = cur.next(step)
+        if not nxt:
             break
-    if best is None:
-        raise RuntimeError(f"no straight road of {length_m} m found on {world_map.name}")
-    best.location.z += 0.5
-    return best
+        cur = nxt[0]
+        if cur.is_junction or abs(yaw_diff_deg(cur.transform.rotation.yaw, yaw0)) > max_yaw_dev_deg:
+            break
+        travelled += step
+    return travelled
+
+
+def find_straight_spawn(world_map: carla.Map, length_m: float, max_yaw_dev_deg: float) -> carla.Transform:
+    """Return the start of the longest straight, junction-free driving lane (at least length_m)."""
+    best_wp, best_len = None, 0.0
+    for wp in world_map.generate_waypoints(10.0):
+        if wp.lane_type != carla.LaneType.Driving or wp.is_junction:
+            continue
+        length = straight_length(wp, length_m + 50.0, max_yaw_dev_deg)
+        if length > best_len:
+            best_wp, best_len = wp, length
+            if best_len >= length_m + 50.0:
+                break
+    if best_wp is None or best_len < length_m:
+        raise RuntimeError(
+            f"longest straight on {world_map.name} is {best_len:.0f} m, need {length_m:.0f} m"
+        )
+    print(f"straight road: {best_len:.0f} m from {best_wp.transform.location}", flush=True)
+    spawn = carla.Transform(best_wp.transform.location, best_wp.transform.rotation)
+    spawn.location.z += 0.5
+    return spawn
 
 
 def set_friction(vehicle: carla.Vehicle, friction: float | None) -> list[float]:
@@ -145,6 +153,8 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--dt", type=float, default=0.05, help="Fixed delta seconds (LEAD runs at 20 Hz)")
     parser.add_argument("--out", type=Path, default=Path("outputs/brake_test.csv"))
+    parser.add_argument("--road-length", type=float, default=250.0,
+                        help="Required straight road length in metres")
     args = parser.parse_args()
 
     client = carla.Client("localhost", args.port)
@@ -154,10 +164,21 @@ def main() -> None:
     settings.synchronous_mode = True
     settings.fixed_delta_seconds = args.dt
     world.apply_settings(settings)
+    try:
+        run(args, client, world)
+    finally:
+        # Always leave the server in asynchronous mode, also after errors,
+        # otherwise the next client blocks on a server waiting for ticks.
+        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = None
+        world.apply_settings(settings)
+
+
+def run(args, client: carla.Client, world: carla.World) -> None:
     world.tick()
     world_map = world.get_map()
     blueprint = world.get_blueprint_library().find(args.blueprint)
-    spawn = find_straight_spawn(world_map, length_m=350.0, max_yaw_dev_deg=3.0)
+    spawn = find_straight_spawn(world_map, length_m=args.road_length, max_yaw_dev_deg=3.0)
     print(f"server {client.get_server_version()}, map {world_map.name}, spawn {spawn.location}", flush=True)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -166,23 +187,18 @@ def main() -> None:
     with open(args.out, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
-        try:
-            for f_str in args.frictions.split(","):
-                friction = None if f_str == "default" else float(f_str)
-                for v0 in (float(s) for s in args.speeds.split(",")):
-                    for brake in (float(b) for b in args.brakes.split(",")):
-                        for rep in range(args.repeats):
-                            res = trial(world, world_map, spawn, blueprint, friction, v0, brake, args.dt, 20)
-                            res["repeat"] = rep
-                            res["friction_set"] = f_str
-                            res["friction_applied"] = "/".join(f"{x:.3f}" for x in res["friction_applied"])
-                            writer.writerow(res)
-                            fh.flush()
-                            print(res, flush=True)
-        finally:
-            settings.synchronous_mode = False
-            settings.fixed_delta_seconds = None
-            world.apply_settings(settings)
+        for f_str in args.frictions.split(","):
+            friction = None if f_str == "default" else float(f_str)
+            for v0 in (float(s) for s in args.speeds.split(",")):
+                for brake in (float(b) for b in args.brakes.split(",")):
+                    for rep in range(args.repeats):
+                        res = trial(world, world_map, spawn, blueprint, friction, v0, brake, args.dt, 20)
+                        res["repeat"] = rep
+                        res["friction_set"] = f_str
+                        res["friction_applied"] = "/".join(f"{x:.3f}" for x in res["friction_applied"])
+                        writer.writerow(res)
+                        fh.flush()
+                        print(res, flush=True)
 
 
 if __name__ == "__main__":
