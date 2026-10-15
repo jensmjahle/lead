@@ -7,8 +7,9 @@ output directory, so finished routes are skipped on restart and infrastructure
 failures can be retried without touching valid results.
 
 Infrastructure failures (simulator crash, agent setup or runtime crash,
-invalid sensors, tick deadline, missing results) are retried and logged
-separately; they are never counted as driving failures.
+invalid sensors, missing results) are retried and logged separately; they are
+never counted as driving failures. The Bench2Drive game-time cap (TickRuntime)
+is a driving outcome and is not retried.
 
 Example:
     python scripts/winter/run_parallel.py \
@@ -33,12 +34,15 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 NVIDIA_ICD = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+# Statuses that indicate a broken run rather than a driving outcome. "TickRuntime"
+# is deliberately absent: Bench2Drive aborts a route after 4000 ticks (200 s of
+# game time) when the agent is too slow or stuck. That is deterministic and a
+# driving outcome; LEAD's result_parser keeps its partial score.
 INFRA_MARKERS = (
     "Simulation crashed",
     "Agent's sensors were invalid",
     "Agent couldn't be set up",
     "Agent crashed",
-    "TickRuntime",
 )
 PRINT_LOCK = threading.Lock()
 RESULTS_LOCK = threading.Lock()
