@@ -167,8 +167,14 @@ def run_route(args, slot: Slot, route: Path, out_dir: Path) -> dict | None:
     env["LEAD_RUNTIME_TYPE_CHECKING"] = "false"
     env["LEAD_EVAL_LIDAR"] = "true" if args.lidar else "false"
     env["PYTHONUNBUFFERED"] = "1"
-    if args.lead_config:
-        env["LEAD_CONFIG"] = args.lead_config
+    lead_config = [args.lead_config] if args.lead_config else []
+    if args.demo_video:
+        lead_config.append("evaluation.produce_demo_video=true")
+    if lead_config:
+        env["LEAD_CONFIG"] = " ".join(lead_config)
+    else:
+        env.pop("LEAD_CONFIG", None)
+    env["LEAD_WINTER_VIDEO"] = "1" if args.winter_video else ""
     env["LEAD_SNOW"] = args.snow
     env["LEAD_SNOW_FALL"] = "" if args.snow_fall is None else str(args.snow_fall)
     env["LEAD_SNOW_COVER"] = "" if args.snow_cover is None else str(args.snow_cover)
@@ -253,7 +259,21 @@ def worker(args, slot: Slot, todo: "queue.Queue[tuple[Path, int]]", results_path
     server.stop()
 
 
+def check_environment() -> None:
+    """Fail fast when the runner is started outside the LEAD environment."""
+    missing = []
+    for module in ("carla", "lead"):
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(module)
+    if missing:
+        sys.exit(f"cannot import {', '.join(missing)} with {sys.executable}; "
+                 "run 'micromamba activate lead' in this shell first")
+
+
 def main() -> None:
+    check_environment()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--routes-dir", type=Path, required=True, help="Directory with one XML per route")
@@ -276,6 +296,10 @@ def main() -> None:
     parser.add_argument("--tire-friction", type=float, default=None,
                         help="Ego per-wheel tire_friction (CARLA default 3.5; 0.3 ~ packed snow)")
     parser.add_argument("--snow-seed", type=int, default=0)
+    parser.add_argument("--winter-video", action="store_true",
+                        help="Write winter_view.mp4 per route: the six policy cameras as the model sees them")
+    parser.add_argument("--demo-video", action="store_true",
+                        help="Also write LEAD's third-person demo video per route (slower)")
     parser.add_argument("--snow-dump-every", type=int, default=0,
                         help="Save raw/overlaid frames every N steps into each route dir (0 = off)")
     parser.add_argument("--max-attempts", type=int, default=3)

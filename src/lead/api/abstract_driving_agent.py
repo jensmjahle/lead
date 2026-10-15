@@ -308,6 +308,181 @@ class AbstractDrivingAgent(BaseAgent, autonomous_agent.AutonomousAgent, abc.ABC)
             ),
         )
 
+    # ------------------------------------------------------------------
+    # Winter perturbations (installed by scripts/winter/install_winter_hooks.py)
+    # ------------------------------------------------------------------
+    def _winter_setup(self) -> None:
+        """Read the winter settings once per route; apply friction; spawn mask cameras."""
+        from lead.winter import snow as winter_snow
+
+        env = os.environ
+        fall, cover = winter_snow.levels_from_env(
+            env.get("LEAD_SNOW", "off"), env.get("LEAD_SNOW_FALL", ""), env.get("LEAD_SNOW_COVER", "")
+        )
+        dump_dir = env.get("LEAD_SNOW_DUMP_DIR", "")
+        if dump_dir == "auto":
+            dump_dir = os.path.join(env.get("SAVE_PATH", "."), "snow_frames")
+        self._winter = {
+            "module": winter_snow,
+            "fall": fall,
+            "cover": cover,
+            "seed": int(env.get("LEAD_SNOW_SEED", "0") or 0),
+            "dump_dir": dump_dir,
+            "dump_every": max(1, int(env.get("LEAD_SNOW_DUMP_EVERY", "40") or 40)),
+            "renderers": {},
+            "sem_actors": [],
+            "sem_latest": {},
+            "sem_misses": 0,
+            "pose": None,
+            "video": env.get("LEAD_WINTER_VIDEO", "") in ("1", "true", "True"),
+            "video_every": max(1, int(env.get("LEAD_WINTER_VIDEO_EVERY", "1") or 1)),
+            "video_path": os.path.join(env.get("SAVE_PATH", "."), "winter_view.mp4"),
+            "video_writer": None,
+            "frame_raw": {},
+            "frame_out": {},
+        }
+        hero = CarlaDataProvider.get_hero_actor()
+
+        friction = env.get("LEAD_TIRE_FRICTION", "")
+        if friction and hero is not None:
+            value = float(friction)
+            physics = hero.get_physics_control()
+            wheels = physics.wheels
+            for wheel in wheels:
+                wheel.tire_friction = value
+            physics.wheels = wheels
+            hero.apply_physics_control(physics)
+            LOG.info(f"Winter hook: ego tire_friction set to {value}")
+
+        if fall > 0.0 or cover > 0.0:
+            LOG.info(f"Winter hook: snow fall={fall}, cover={cover}, seed={self._winter['seed']}")
+        if cover > 0.0 and hero is not None:
+            world = CarlaDataProvider.get_world()
+            rig = self.lead_config.expert.sensor_rig.cameras
+            latest = self._winter["sem_latest"]
+            for camera_id in self.policy.input_cameras:
+                spec = rig[int(LEAD_INDEX_BY_CAMERA_ID[camera_id]) - 1]
+                blueprint = world.get_blueprint_library().find("sensor.camera.semantic_segmentation")
+                blueprint.set_attribute("image_size_x", str(spec["width"]))
+                blueprint.set_attribute("image_size_y", str(spec["height"]))
+                blueprint.set_attribute("fov", str(spec["fov"]))
+                transform = carla.Transform(
+                    carla.Location(x=spec["pos"][0], y=spec["pos"][1], z=spec["pos"][2]),
+                    carla.Rotation(roll=spec["rot"][0], pitch=spec["rot"][1], yaw=spec["rot"][2]),
+                )
+                actor = world.spawn_actor(blueprint, transform, attach_to=hero)
+
+                def _store(img, key=camera_id, store=latest):
+                    tags = np.frombuffer(img.raw_data, dtype=np.uint8).reshape(img.height, img.width, 4)
+                    store[key] = (img.frame, tags[:, :, 2].copy())
+
+                actor.listen(_store)
+                self._winter["sem_actors"].append(actor)
+
+    def _winter_step(self) -> None:
+        """Per-step bookkeeping: lazy setup and the ego pose for world-anchored cover."""
+        if not hasattr(self, "_winter"):
+            self._winter_setup()
+        winter = self._winter
+        self._winter_flush_video()
+        if winter["cover"] > 0.0:
+            hero = CarlaDataProvider.get_hero_actor()
+            if hero is not None:
+                t = hero.get_transform()
+                winter["pose"] = winter["module"].EgoPose(t.location.x, t.location.y, t.rotation.yaw)
+
+    def _winter_semantic(self, camera_id) -> np.ndarray | None:
+        """Semantic tags of the current frame for one camera (waits briefly for the callback)."""
+        import time as _time
+
+        winter = self._winter
+        target = CarlaDataProvider.get_world().get_snapshot().frame
+        deadline = _time.time() + 0.5
+        while True:
+            entry = winter["sem_latest"].get(camera_id)
+            if entry is not None and entry[0] >= target:
+                return entry[1]
+            if _time.time() > deadline:
+                winter["sem_misses"] += 1
+                return None if entry is None else entry[1]
+            _time.sleep(0.001)
+
+    def _winter_effects(self, camera_id, image: np.ndarray) -> np.ndarray:
+        """Render snow on one policy camera before the JPEG round-trip."""
+        winter = self._winter
+        fall, cover = winter["fall"], winter["cover"]
+        if fall <= 0.0 and cover <= 0.0 and not winter["dump_dir"] and not winter["video"]:
+            return image
+        image = np.ascontiguousarray(image)
+        out, semantic = image, None
+        idx = int(LEAD_INDEX_BY_CAMERA_ID[camera_id])
+        if fall > 0.0 or cover > 0.0:
+            renderer = winter["renderers"].get(camera_id)
+            if renderer is None:
+                spec = self.lead_config.expert.sensor_rig.cameras[idx - 1]
+                geometry = winter["module"].CameraGeometry(
+                    spec["width"], spec["height"], spec["fov"], spec["pos"], spec["rot"]
+                )
+                renderer = winter["module"].SnowRenderer(
+                    image.shape[0], image.shape[1], fall, cover,
+                    world_seed=winter["seed"], particle_seed=winter["seed"] * 100 + idx,
+                    fps=float(self.lead_config.expert.simulation.carla_fps), geometry=geometry,
+                )
+                winter["renderers"][camera_id] = renderer
+            if cover > 0.0:
+                semantic = self._winter_semantic(camera_id)
+            out = renderer(image, semantic, winter["pose"])
+        if winter["dump_dir"] and self.step % winter["dump_every"] == 0:
+            os.makedirs(winter["dump_dir"], exist_ok=True)
+            stem = os.path.join(winter["dump_dir"], f"{max(self.step, 0):05d}_cam{idx}")
+            cv2.imwrite(stem + "_raw.jpg", image)
+            if out is not image:
+                cv2.imwrite(stem + "_snow.jpg", out)
+            if semantic is not None:
+                cv2.imwrite(stem + "_mask.png", (winter["module"]._COVER_LUT[semantic] * 255).astype(np.uint8))
+        if winter["video"] and self.step % winter["video_every"] == 0:
+            winter["frame_raw"][idx] = image
+            winter["frame_out"][idx] = out
+        return out
+
+    def _winter_flush_video(self) -> None:
+        """Write the cameras collected in the previous step as one video frame."""
+        winter = self._winter
+        if not winter["video"] or not winter["frame_raw"]:
+            return
+        order = sorted(winter["frame_raw"])
+        raw = np.hstack([winter["frame_raw"][i] for i in order])
+        perturbed = winter["fall"] > 0.0 or winter["cover"] > 0.0
+        frame = np.vstack([raw, np.hstack([winter["frame_out"][i] for i in order])]) if perturbed else raw
+        frame = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2), interpolation=cv2.INTER_AREA)
+        if winter["video_writer"] is None:
+            fps = float(self.lead_config.expert.simulation.carla_fps) / winter["video_every"]
+            os.makedirs(os.path.dirname(winter["video_path"]) or ".", exist_ok=True)
+            winter["video_writer"] = cv2.VideoWriter(
+                winter["video_path"], cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame.shape[1], frame.shape[0])
+            )
+        winter["video_writer"].write(np.ascontiguousarray(frame))
+        winter["frame_raw"], winter["frame_out"] = {}, {}
+
+    def _winter_cleanup(self) -> None:
+        """Destroy the semantic mask cameras and report missed mask frames."""
+        winter = getattr(self, "_winter", None)
+        if not winter:
+            return
+        self._winter_flush_video()
+        if winter.get("video_writer") is not None:
+            winter["video_writer"].release()
+            winter["video_writer"] = None
+        for actor in winter["sem_actors"]:
+            try:
+                actor.stop()
+                actor.destroy()
+            except RuntimeError:
+                pass
+        winter["sem_actors"] = []
+        if winter["sem_misses"]:
+            LOG.warning(f"Winter hook: {winter['sem_misses']} camera frames used a stale or missing mask")
+
     def _cameras(self, sensor_data: CarlaSensorData) -> list[Camera]:
         """The tick's cameras of the active policy, in stitch order, as 123D modalities.
 
@@ -321,8 +496,10 @@ class AbstractDrivingAgent(BaseAgent, autonomous_agent.AutonomousAgent, abc.ABC)
             ),
         )
         cameras: list[Camera] = []
+        self._winter_step()
         for camera_id in self.policy.input_cameras:
             image = sensor_data[f"rgb_{LEAD_INDEX_BY_CAMERA_ID[camera_id]}"]
+            image = self._winter_effects(camera_id, image)
             _, encoded = cv2.imencode(
                 ".jpg",
                 cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
@@ -637,6 +814,7 @@ class AbstractDrivingAgent(BaseAgent, autonomous_agent.AutonomousAgent, abc.ABC)
         return self.control
 
     def destroy(self, results: object = None) -> None:
+        self._winter_cleanup()
         LOG.info(results)
 
         # Clean up video recorder

@@ -17,6 +17,9 @@ Runtime switches (environment variables, read once per route):
     LEAD_SNOW_DUMP_DIR     directory for sample frames, or "auto" for <SAVE_PATH>/snow_frames
     LEAD_SNOW_DUMP_EVERY   dump every N steps (default 40)
     LEAD_TIRE_FRICTION     per-wheel tire_friction for the ego vehicle (CARLA default 3.5)
+    LEAD_WINTER_VIDEO      1 = write <SAVE_PATH>/winter_view.mp4: the six policy cameras as the
+                           model sees them (top row raw, bottom row perturbed when snow is on)
+    LEAD_WINTER_VIDEO_EVERY  write every N-th step (default 1)
 
 With none of these set the agent behaves exactly as before. The semantic images
 and the ego pose are privileged and only used to render the perturbation; the
@@ -56,6 +59,12 @@ METHODS = '''    # -------------------------------------------------------------
             "sem_latest": {},
             "sem_misses": 0,
             "pose": None,
+            "video": env.get("LEAD_WINTER_VIDEO", "") in ("1", "true", "True"),
+            "video_every": max(1, int(env.get("LEAD_WINTER_VIDEO_EVERY", "1") or 1)),
+            "video_path": os.path.join(env.get("SAVE_PATH", "."), "winter_view.mp4"),
+            "video_writer": None,
+            "frame_raw": {},
+            "frame_out": {},
         }
         hero = CarlaDataProvider.get_hero_actor()
 
@@ -100,6 +109,7 @@ METHODS = '''    # -------------------------------------------------------------
         if not hasattr(self, "_winter"):
             self._winter_setup()
         winter = self._winter
+        self._winter_flush_video()
         if winter["cover"] > 0.0:
             hero = CarlaDataProvider.get_hero_actor()
             if hero is not None:
@@ -126,7 +136,7 @@ METHODS = '''    # -------------------------------------------------------------
         """Render snow on one policy camera before the JPEG round-trip."""
         winter = self._winter
         fall, cover = winter["fall"], winter["cover"]
-        if fall <= 0.0 and cover <= 0.0 and not winter["dump_dir"]:
+        if fall <= 0.0 and cover <= 0.0 and not winter["dump_dir"] and not winter["video"]:
             return image
         image = np.ascontiguousarray(image)
         out, semantic = image, None
@@ -155,13 +165,39 @@ METHODS = '''    # -------------------------------------------------------------
                 cv2.imwrite(stem + "_snow.jpg", out)
             if semantic is not None:
                 cv2.imwrite(stem + "_mask.png", (winter["module"]._COVER_LUT[semantic] * 255).astype(np.uint8))
+        if winter["video"] and self.step % winter["video_every"] == 0:
+            winter["frame_raw"][idx] = image
+            winter["frame_out"][idx] = out
         return out
+
+    def _winter_flush_video(self) -> None:
+        """Write the cameras collected in the previous step as one video frame."""
+        winter = self._winter
+        if not winter["video"] or not winter["frame_raw"]:
+            return
+        order = sorted(winter["frame_raw"])
+        raw = np.hstack([winter["frame_raw"][i] for i in order])
+        perturbed = winter["fall"] > 0.0 or winter["cover"] > 0.0
+        frame = np.vstack([raw, np.hstack([winter["frame_out"][i] for i in order])]) if perturbed else raw
+        frame = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2), interpolation=cv2.INTER_AREA)
+        if winter["video_writer"] is None:
+            fps = float(self.lead_config.expert.simulation.carla_fps) / winter["video_every"]
+            os.makedirs(os.path.dirname(winter["video_path"]) or ".", exist_ok=True)
+            winter["video_writer"] = cv2.VideoWriter(
+                winter["video_path"], cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame.shape[1], frame.shape[0])
+            )
+        winter["video_writer"].write(np.ascontiguousarray(frame))
+        winter["frame_raw"], winter["frame_out"] = {}, {}
 
     def _winter_cleanup(self) -> None:
         """Destroy the semantic mask cameras and report missed mask frames."""
         winter = getattr(self, "_winter", None)
         if not winter:
             return
+        self._winter_flush_video()
+        if winter.get("video_writer") is not None:
+            winter["video_writer"].release()
+            winter["video_writer"] = None
         for actor in winter["sem_actors"]:
             try:
                 actor.stop()
@@ -183,10 +219,32 @@ DESTROY_OLD = "    def destroy(self, results: object = None) -> None:\n"
 DESTROY_NEW = DESTROY_OLD + "        self._winter_cleanup()\n"
 
 
+HEADER = "    # ------------------------------------------------------------------\n    # Winter perturbations (installed by scripts/winter/install_winter_hooks.py)\n"
+
+
+def strip_installed(src: str) -> str:
+    """Remove a previously installed winter block and its call sites."""
+    start = src.index(HEADER)
+    end = src.index(ANCHOR, start)
+    src = src[:start] + src[end:]
+    for line in (STEP_NEW[len(STEP_OLD):], CALL_NEW[len(CALL_OLD):], DESTROY_NEW[len(DESTROY_OLD):]):
+        src = src.replace(line, "", 1)
+    return src
+
+
 def main() -> None:
+    import sys
+
     src = TARGET.read_text()
     if MARKER in src:
-        print("winter hooks already installed")
+        src = strip_installed(src)
+        if "--uninstall" in sys.argv:
+            TARGET.write_text(src)
+            print("winter hooks removed")
+            return
+        print("replacing previously installed winter hooks")
+    elif "--uninstall" in sys.argv:
+        print("winter hooks not installed")
         return
     if V1_MARKER in src:
         raise SystemExit("v1 snow hook found; restore the file with "

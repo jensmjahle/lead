@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Summarize and compare closed-loop evaluation runs from run_parallel.py.
 
-For every route the final record in <run>/<route>/checkpoint_endpoint.json is
-used (the last attempt). Each route is classified as
+For every route the first attempt that was not an infrastructure failure is
+used (from results.jsonl), so retries cannot inflate the score; use
+--attempt final for the last record instead. Each route is classified as
     ok        status Completed or Perfect
     driving   any other driving failure, including the Bench2Drive game-time
               cap (status "Failed - TickRuntime", 4000 ticks = 200 s)
@@ -41,7 +42,30 @@ INFRA_MARKERS = (
 )
 
 
-def load_run(run_dir: Path) -> dict[str, dict]:
+def load_run(run_dir: Path, attempt: str = "first") -> dict[str, dict]:
+    """Per-route record. attempt="first": the first attempt that was not an
+    infrastructure failure, taken from results.jsonl (retries of driving
+    outcomes would otherwise give a best-of-n bias). attempt="final": the record
+    left in checkpoint_endpoint.json by the last attempt."""
+    results = run_dir / "results.jsonl"
+    if attempt == "first" and results.exists():
+        routes: dict[str, dict] = {}
+        attempts: dict[str, list] = {}
+        for line in results.read_text().splitlines():
+            if line.strip():
+                e = json.loads(line)
+                attempts.setdefault(e["route"], []).append(e)
+        for route, entries in attempts.items():
+            chosen = None
+            for e in sorted(entries, key=lambda x: x["attempt"]):
+                rec = None if e.get("status") is None else {
+                    "status": e["status"], "scores": e["scores"],
+                    "meta": {"duration_game": e.get("duration_game")}, "attempt": e["attempt"]}
+                if classify(rec) != "infra":
+                    chosen = rec
+                    break
+            routes[route] = chosen
+        return routes
     routes = {}
     for ckpt in sorted(run_dir.glob("*/checkpoint_endpoint.json")):
         route = ckpt.parent.name
@@ -125,9 +149,12 @@ def main() -> None:
     parser.add_argument("runs", nargs="+", type=Path)
     parser.add_argument("--expected", type=int, default=None, help="Total routes in the benchmark (e.g. 220)")
     parser.add_argument("--csv", type=Path, default=None, help="Write per-route table here")
+    parser.add_argument("--attempt", choices=("first", "final"), default="first",
+                        help="first: first non-infrastructure attempt (default, unbiased); "
+                             "final: last record in checkpoint_endpoint.json")
     args = parser.parse_args()
 
-    loaded = [(run.name, load_run(run)) for run in args.runs]
+    loaded = [(run.name, load_run(run, args.attempt)) for run in args.runs]
     summaries = [summarize(name, routes, args.expected) for name, routes in loaded]
     for s in summaries:
         print(f"== {s['run']}")
